@@ -1,7 +1,12 @@
 # Environment & Secrets
 .env
-.env*.local
+.env.*
 !.env.example
+
+# Frontend Dependencies & Build
+node_modules/
+dist/
+dist-ssr/
 
 # Python virtual environments & bytecode
 .venv/
@@ -14,12 +19,13 @@ __pycache__/
 *.so
 .pytest_cache/
 
-# SQLite databases
+# SQLite databases & uploads
 *.db
 *.sqlite3
-
-# Uploaded files
 uploads/
+
+# Logs
+logs/
 *.log
 
 # Editors & Operating System
@@ -27,4 +33,3 @@ uploads/
 .vscode/
 .DS_Store
 Thumbs.db
-node_modules/
