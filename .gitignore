@@ -1,20 +1,35 @@
-# Logs
-logs
-*.log
-
-# Dependencies
-node_modules/
-
-# Build artifacts
-dist/
-
-# Environment variables
+# Environment & Secrets
 .env
 .env.*
 !.env.example
 
-# OS / Editor
+# Frontend Dependencies & Build
+node_modules/
+dist/
+dist-ssr/
+
+# Python virtual environments & bytecode
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# SQLite databases & uploads
+*.db
+*.sqlite3
+uploads/
+
+# Logs
+logs/
+*.log
+
+# Editors & Operating System
+.idea/
+.vscode/
 .DS_Store
 Thumbs.db
-.vscode/
-.idea/
