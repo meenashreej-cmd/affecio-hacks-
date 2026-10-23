@@ -4,38 +4,52 @@ import { mockServer } from '../mocks/mockServer';
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false';
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
+// Constant for media multipart field name as required by contract
+export const MEDIA_FIELD_NAME = 'file';
+export const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB
+
 /**
  * useChatSocket hook
- * Interacts with either the in-memory mock server or the live FastAPI backend.
+ * Manages WebSocket connection, history hydration, message deduplication,
+ * stateful risk scoring, media upload gating, reports, and connection resilience.
  *
  * @param {number|string} conversationId
  * @param {number|string} userId
- * @returns {{
- *   messages: Array<{id: number, sender_id: number, text: string, created_at: string, flagged?: string}>,
- *   risk: number,
- *   state: 'normal'|'caution'|'restricted',
- *   scamType: string|null,
- *   reasons: string[],
- *   connected: boolean,
- *   send: (text: string) => void,
- *   blockedNotice: string|null,
- *   clearBlockedNotice: () => void,
- *   attemptMediaUpload: (file?: File) => void,
- * }}
  */
 export function useChatSocket(conversationId = 1, userId = 1) {
   const [messages, setMessages] = useState([]);
   const [risk, setRisk] = useState(10);
-  const [state, setState] = useState('normal');
+  const [state, setState] = useState('normal'); // 'normal' | 'caution' | 'restricted'
   const [scamType, setScamType] = useState(null);
   const [reasons, setReasons] = useState([]);
-  const [connected, setConnected] = useState(false);
+  const [signals, setSignals] = useState([]);
+
+  // Loading & error states
+  const [loading, setLoading] = useState(true);
+  const [historyError, setHistoryError] = useState(null);
+
+  // Connection states: 'connected' | 'reconnecting' | 'offline'
+  const [connectionStatus, setConnectionStatus] = useState('connecting');
   const [blockedNotice, setBlockedNotice] = useState(null);
+
+  // Debug strip events (last 5 raw events)
+  const [rawEvents, setRawEvents] = useState([]);
 
   const socketRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const isMountedRef = useRef(true);
+
+  // Track raw event for debug strip
+  const recordRawEvent = useCallback((type, payload) => {
+    const eventSummary = {
+      id: Math.random().toString(36).substring(2, 9),
+      type,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+      snippet: typeof payload === 'string' ? payload : JSON.stringify(payload).slice(0, 90),
+    };
+    setRawEvents((prev) => [eventSummary, ...prev.slice(0, 4)]);
+  }, []);
 
   // Helper to deduplicate messages by ID
   const appendMessage = useCallback((msg) => {
@@ -52,34 +66,62 @@ export function useChatSocket(conversationId = 1, userId = 1) {
     setBlockedNotice(null);
   }, []);
 
+  // Insert in-chat system notification for media blockages
+  const surfaceMediaBlockedInChat = useCallback(
+    (reasonText) => {
+      const systemNotice = {
+        id: `sys-blocked-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        sender_id: 0,
+        isSystemNotice: true,
+        text: `Media blocked: ${reasonText}`,
+        created_at: new Date().toISOString(),
+      };
+      appendMessage(systemNotice);
+      setBlockedNotice(reasonText);
+    },
+    [appendMessage]
+  );
+
   // -------------------------------------------------------------
   // MOCK IMPLEMENTATION
   // -------------------------------------------------------------
+  const loadMockHistory = useCallback(async () => {
+    setLoading(true);
+    setHistoryError(null);
+    try {
+      const [initialMsgs, riskData] = await Promise.all([
+        mockServer.getMessages(conversationId),
+        mockServer.getRisk(conversationId),
+      ]);
+      if (isMountedRef.current) {
+        setMessages(initialMsgs || []);
+        if (riskData) {
+          setRisk(Math.min(100, Math.max(0, riskData.risk ?? 10)));
+          setState(riskData.state ?? 'normal');
+          setScamType(riskData.scam_type ?? null);
+          setReasons(riskData.reasons ?? []);
+          setSignals(riskData.signals ?? []);
+        }
+        setConnectionStatus('connected');
+        setLoading(false);
+      }
+    } catch (err) {
+      if (isMountedRef.current) {
+        setHistoryError(err.message || 'Failed to load conversation history.');
+        setLoading(false);
+      }
+    }
+  }, [conversationId]);
+
   useEffect(() => {
     if (!USE_MOCK) return;
 
     isMountedRef.current = true;
-    setConnected(true);
+    loadMockHistory();
 
-    // Initial load: history + risk
-    mockServer.getMessages(conversationId).then((initialMsgs) => {
-      if (isMountedRef.current) {
-        setMessages(initialMsgs);
-      }
-    });
-
-    mockServer.getRisk(conversationId).then((riskData) => {
-      if (isMountedRef.current && riskData) {
-        setRisk(riskData.risk ?? 10);
-        setState(riskData.state ?? 'normal');
-        setScamType(riskData.scam_type ?? null);
-        setReasons(riskData.reasons ?? []);
-      }
-    });
-
-    // Subscribe to events broadcasted across all panes
     const unsubscribe = mockServer.subscribe((event) => {
       if (!isMountedRef.current) return;
+      recordRawEvent(event.type, event);
 
       switch (event.type) {
         case 'message':
@@ -88,18 +130,32 @@ export function useChatSocket(conversationId = 1, userId = 1) {
 
         case 'risk_update':
           if (Number(event.conversation_id) === Number(conversationId)) {
-            setRisk(event.risk ?? 0);
+            setRisk(Math.min(100, Math.max(0, event.risk ?? 0)));
             setState(event.state ?? 'normal');
             setScamType(event.scam_type ?? null);
             setReasons(event.reasons ?? []);
+            setSignals(event.signals ?? []);
           }
           break;
 
         case 'media_blocked':
           if (Number(event.conversation_id) === Number(conversationId)) {
-            const reasonText = event.reasons?.[0] || 'Media upload blocked: Thread is under restricted state.';
-            setBlockedNotice(reasonText);
+            const reasonText =
+              event.reasons?.join(', ') ||
+              'Media sharing is disabled because this conversation looks risky.';
+            surfaceMediaBlockedInChat(reasonText);
           }
+          break;
+
+        case '__mock_disconnect__':
+          // Simulate socket drop for verification
+          setConnectionStatus('reconnecting');
+          setTimeout(() => {
+            if (isMountedRef.current) {
+              setConnectionStatus('connected');
+              loadMockHistory();
+            }
+          }, 2500);
           break;
 
         case 'reset':
@@ -109,7 +165,9 @@ export function useChatSocket(conversationId = 1, userId = 1) {
             setState('normal');
             setScamType(null);
             setReasons([]);
+            setSignals([]);
             setBlockedNotice(null);
+            setConnectionStatus('connected');
           }
           break;
 
@@ -122,48 +180,59 @@ export function useChatSocket(conversationId = 1, userId = 1) {
       isMountedRef.current = false;
       unsubscribe();
     };
-  }, [conversationId, appendMessage]);
+  }, [conversationId, appendMessage, surfaceMediaBlockedInChat, recordRawEvent, loadMockHistory]);
 
   // -------------------------------------------------------------
   // REAL NETWORK IMPLEMENTATION (REST + WEBSOCKET)
   // -------------------------------------------------------------
+  const loadRealHistoryAndRisk = useCallback(async () => {
+    setLoading(true);
+    setHistoryError(null);
+    try {
+      const [msgsRes, riskRes] = await Promise.all([
+        fetch(`${API_URL}/conversations/${conversationId}/messages`),
+        fetch(`${API_URL}/conversations/${conversationId}/risk`),
+      ]);
+
+      if (!msgsRes.ok) {
+        throw new Error(`Failed to load messages: HTTP ${msgsRes.status}`);
+      }
+      if (!riskRes.ok) {
+        throw new Error(`Failed to load risk data: HTTP ${riskRes.status}`);
+      }
+
+      const msgsData = await msgsRes.json();
+      const riskData = await riskRes.json();
+
+      if (isMountedRef.current) {
+        if (Array.isArray(msgsData)) {
+          setMessages(msgsData);
+        }
+        if (riskData) {
+          setRisk(Math.min(100, Math.max(0, riskData.risk ?? 0)));
+          setState(riskData.state ?? 'normal');
+          setScamType(riskData.scam_type ?? null);
+          setReasons(riskData.reasons ?? []);
+          setSignals(riskData.signals ?? []);
+        }
+        setLoading(false);
+      }
+    } catch (err) {
+      if (isMountedRef.current) {
+        setHistoryError(
+          err.message || `Cannot reach the server at ${API_URL}. Check that backend is running.`
+        );
+        setLoading(false);
+      }
+    }
+  }, [conversationId]);
+
   useEffect(() => {
     if (USE_MOCK) return;
 
     isMountedRef.current = true;
+    loadRealHistoryAndRisk();
 
-    // 1. Initial REST fetch for history & risk
-    const fetchHistoryAndRisk = async () => {
-      try {
-        const [msgsRes, riskRes] = await Promise.all([
-          fetch(`${API_URL}/conversations/${conversationId}/messages`),
-          fetch(`${API_URL}/conversations/${conversationId}/risk`),
-        ]);
-
-        if (msgsRes.ok) {
-          const msgsData = await msgsRes.json();
-          if (isMountedRef.current && Array.isArray(msgsData)) {
-            setMessages(msgsData);
-          }
-        }
-
-        if (riskRes.ok) {
-          const riskData = await riskRes.json();
-          if (isMountedRef.current && riskData) {
-            setRisk(riskData.risk ?? 0);
-            setState(riskData.state ?? 'normal');
-            setScamType(riskData.scam_type ?? null);
-            setReasons(riskData.reasons ?? []);
-          }
-        }
-      } catch (err) {
-        console.warn('Failed to fetch initial history/risk:', err);
-      }
-    };
-
-    fetchHistoryAndRisk();
-
-    // 2. Setup WebSocket connection with auto-reconnect & exponential backoff
     const connectSocket = () => {
       if (!isMountedRef.current) return;
 
@@ -178,8 +247,10 @@ export function useChatSocket(conversationId = 1, userId = 1) {
 
         ws.onopen = () => {
           if (isMountedRef.current) {
-            setConnected(true);
+            setConnectionStatus('connected');
             reconnectAttemptsRef.current = 0;
+            // Refetch history and risk on successful reconnect to ensure nothing was dropped
+            loadRealHistoryAndRisk();
           }
         };
 
@@ -187,6 +258,8 @@ export function useChatSocket(conversationId = 1, userId = 1) {
           if (!isMountedRef.current) return;
           try {
             const data = JSON.parse(event.data);
+            recordRawEvent(data.type, data);
+
             switch (data.type) {
               case 'message':
                 if (data.message) {
@@ -196,24 +269,29 @@ export function useChatSocket(conversationId = 1, userId = 1) {
 
               case 'risk_update':
                 if (Number(data.conversation_id) === Number(conversationId)) {
-                  setRisk(data.risk ?? 0);
+                  setRisk(Math.min(100, Math.max(0, data.risk ?? 0)));
                   setState(data.state ?? 'normal');
                   setScamType(data.scam_type ?? null);
                   setReasons(data.reasons ?? []);
+                  setSignals(data.signals ?? []);
                 }
                 break;
 
               case 'media_blocked':
                 if (Number(data.conversation_id) === Number(conversationId)) {
-                  setBlockedNotice(data.reasons?.[0] || 'Media upload blocked.');
+                  const reasonText =
+                    data.reasons?.join(', ') ||
+                    'Media sharing is disabled because this conversation looks risky.';
+                  surfaceMediaBlockedInChat(reasonText);
                 }
                 break;
 
               default:
+                // Defensive parsing: ignore unknown event types cleanly
                 break;
             }
           } catch (e) {
-            console.error('Failed to parse websocket message:', e);
+            console.warn('Failed to parse websocket message:', e);
           }
         };
 
@@ -223,16 +301,16 @@ export function useChatSocket(conversationId = 1, userId = 1) {
 
         ws.onclose = () => {
           if (!isMountedRef.current) return;
-          setConnected(false);
+          setConnectionStatus('reconnecting');
 
-          // Exponential backoff reconnect: 1s, 2s, 4s, 8s, capped at 10s
+          // Exponential backoff: 1s, 2s, 4s, 8s, max 10s
           const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 10000);
           reconnectAttemptsRef.current += 1;
           reconnectTimeoutRef.current = setTimeout(connectSocket, delay);
         };
       } catch (err) {
         console.error('Failed to initialize WebSocket:', err);
-        setConnected(false);
+        setConnectionStatus('offline');
       }
     };
 
@@ -247,63 +325,110 @@ export function useChatSocket(conversationId = 1, userId = 1) {
         socketRef.current.close();
       }
     };
-  }, [conversationId, userId, appendMessage]);
+  }, [conversationId, userId, appendMessage, surfaceMediaBlockedInChat, recordRawEvent, loadRealHistoryAndRisk]);
 
   // -------------------------------------------------------------
-  // SEND MESSAGE
+  // SEND MESSAGE WITH RETRY & ERROR HANDLING
   // -------------------------------------------------------------
   const send = useCallback(
-    (text) => {
+    async (text) => {
       if (!text || !text.trim()) return;
+      const trimmed = text.trim();
 
       if (USE_MOCK) {
-        mockServer.sendMessage(conversationId, userId, text);
+        mockServer.sendMessage(conversationId, userId, trimmed);
         return;
       }
 
       // Real WebSocket client -> server
       if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        socketRef.current.send(
-          JSON.stringify({
-            type: 'message',
-            sender_id: Number(userId),
-            text: text.trim(),
-          })
-        );
-      } else {
-        // Fallback to REST POST /conversations/{id}/messages
-        fetch(`${API_URL}/conversations/${conversationId}/messages`, {
+        try {
+          socketRef.current.send(
+            JSON.stringify({
+              type: 'message',
+              sender_id: Number(userId),
+              text: trimmed,
+            })
+          );
+          return;
+        } catch (wsErr) {
+          console.warn('WS send failed, attempting REST fallback:', wsErr);
+        }
+      }
+
+      // REST fallback
+      try {
+        const res = await fetch(`${API_URL}/conversations/${conversationId}/messages`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             sender_id: Number(userId),
-            text: text.trim(),
+            text: trimmed,
           }),
-        }).catch((err) => console.error('Failed to send message via REST:', err));
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      } catch (err) {
+        console.error('Failed to deliver message:', err);
+        // Add optimistic failed message to list with retry capability
+        const failedMsg = {
+          id: `temp-${Date.now()}`,
+          sender_id: Number(userId),
+          text: trimmed,
+          created_at: new Date().toISOString(),
+          failed: true,
+        };
+        appendMessage(failedMsg);
       }
     },
-    [conversationId, userId]
+    [conversationId, userId, appendMessage]
+  );
+
+  const retrySend = useCallback(
+    (failedMsgId, text) => {
+      // Remove temporary failed message and re-send
+      setMessages((prev) => prev.filter((m) => m.id !== failedMsgId));
+      send(text);
+    },
+    [send]
   );
 
   // -------------------------------------------------------------
-  // MEDIA UPLOAD / PAPERCLIP ATTEMPT
+  // UPLOAD MEDIA (with client-side size check & 403 handling)
   // -------------------------------------------------------------
-  const attemptMediaUpload = useCallback(
-    async (file) => {
+  const uploadMedia = useCallback(
+    async (file, bypassCheck = false) => {
+      if (!file) return { ok: false, error: 'No file selected' };
+
+      // Client-side file size check (~5MB limit)
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        const errorMsg = 'File exceeds the 5 MB limit. Please select a smaller file.';
+        return { ok: false, error: errorMsg };
+      }
+
       if (USE_MOCK) {
-        const result = mockServer.trySendMedia(conversationId, userId);
-        if (!result.allowed) {
-          setBlockedNotice(result.reasons[0]);
+        const res = await mockServer.uploadMedia({
+          conversationId,
+          senderId: userId,
+          file,
+          bypassCheck,
+        });
+
+        if (!res.ok && res.status === 403) {
+          const reasonsList = res.data?.reasons || ['High risk behavior detected'];
+          const reasonText = reasonsList.join(', ');
+          surfaceMediaBlockedInChat(reasonText);
+          return { ok: false, status: 403, reasons: reasonsList };
         }
-        return;
+        return { ok: true, status: 201 };
       }
 
       // Real REST POST /conversations/{id}/media
       const formData = new FormData();
+      formData.append(MEDIA_FIELD_NAME, file);
       formData.append('sender_id', String(userId));
-      if (file) {
-        formData.append('file', file);
-      }
 
       try {
         const res = await fetch(`${API_URL}/conversations/${conversationId}/media`, {
@@ -312,12 +437,79 @@ export function useChatSocket(conversationId = 1, userId = 1) {
         });
 
         if (res.status === 403) {
-          const errData = await res.json().catch(() => ({}));
-          const reasonMsg = errData.detail || 'Media upload blocked: Thread state is restricted.';
-          setBlockedNotice(reasonMsg);
+          const body = await res.json().catch(() => ({}));
+          // Defensively parse reasons from body.reasons, body.detail.reasons, or body.detail
+          let reasonsList = [];
+          if (Array.isArray(body.reasons) && body.reasons.length > 0) {
+            reasonsList = body.reasons;
+          } else if (body.detail && Array.isArray(body.detail.reasons)) {
+            reasonsList = body.detail.reasons;
+          } else if (typeof body.detail === 'string') {
+            reasonsList = [body.detail];
+          } else {
+            reasonsList = ['Media sharing is disabled because this conversation looks risky'];
+          }
+
+          const reasonText = reasonsList.join(', ');
+          surfaceMediaBlockedInChat(reasonText);
+          return { ok: false, status: 403, reasons: reasonsList };
         }
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          const errMsg = errData.detail || `Upload failed: HTTP ${res.status}`;
+          return { ok: false, status: res.status, error: errMsg };
+        }
+
+        const data = await res.json();
+        return { ok: true, status: 201, data };
       } catch (err) {
-        console.error('Failed to upload media:', err);
+        console.error('Media upload request error:', err);
+        return { ok: false, error: err.message || 'Network error during upload' };
+      }
+    },
+    [conversationId, userId, surfaceMediaBlockedInChat]
+  );
+
+  // -------------------------------------------------------------
+  // SUBMIT REPORT (POST /reports)
+  // -------------------------------------------------------------
+  const submitReport = useCallback(
+    async (reasonText) => {
+      if (!reasonText || !reasonText.trim()) {
+        return { ok: false, error: 'Reason is required' };
+      }
+
+      if (USE_MOCK) {
+        const res = await mockServer.submitReport({
+          conversationId,
+          reporterId: userId,
+          reason: reasonText.trim(),
+        });
+        return { ok: true, data: res };
+      }
+
+      try {
+        const res = await fetch(`${API_URL}/reports`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            conversation_id: Number(conversationId),
+            reporter_id: Number(userId),
+            reason: reasonText.trim(),
+          }),
+        });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.detail || `HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+        return { ok: true, data };
+      } catch (err) {
+        console.error('Failed to submit report:', err);
+        return { ok: false, error: err.message || 'Failed to submit report' };
       }
     },
     [conversationId, userId]
@@ -329,10 +521,20 @@ export function useChatSocket(conversationId = 1, userId = 1) {
     state,
     scamType,
     reasons,
-    connected,
+    signals,
+    loading,
+    historyError,
+    retryLoadHistory: USE_MOCK ? loadMockHistory : loadRealHistoryAndRisk,
+    connected: connectionStatus === 'connected',
+    connectionStatus,
     send,
+    retrySend,
     blockedNotice,
     clearBlockedNotice,
-    attemptMediaUpload,
+    uploadMedia,
+    submitReport,
+    rawEvents,
   };
 }
+
+export default useChatSocket;

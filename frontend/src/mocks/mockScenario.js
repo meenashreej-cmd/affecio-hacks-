@@ -14,6 +14,7 @@ export const SCAM_SCENARIO = [
       state: "normal",
       scam_type: "none",
       reasons: [],
+      signals: [],
     },
     flagged: null,
   },
@@ -34,6 +35,12 @@ export const SCAM_SCENARIO = [
       scam_type: "romance",
       reasons: [
         "Fast emotional escalation (intense romantic claims within first 3 messages)",
+      ],
+      signals: [
+        {
+          label: "Fast emotional escalation (intense romantic claims within first 3 messages)",
+          evidence_msg_id: 3,
+        },
       ],
     },
     flagged: "caution",
@@ -57,6 +64,16 @@ export const SCAM_SCENARIO = [
         "Fast emotional escalation",
         "Asked to move off-app by message 3",
       ],
+      signals: [
+        {
+          label: "Asked to move off-app by message 3",
+          evidence_msg_id: 5,
+        },
+        {
+          label: "Fast emotional escalation",
+          evidence_msg_id: 3,
+        },
+      ],
     },
     flagged: "caution",
   },
@@ -73,6 +90,20 @@ export const SCAM_SCENARIO = [
         "Asked to move off-app by message 3",
         "Fast emotional escalation",
       ],
+      signals: [
+        {
+          label: "Urgent money request",
+          evidence_msg_id: 6,
+        },
+        {
+          label: "Asked to move off-app by message 3",
+          evidence_msg_id: 5,
+        },
+        {
+          label: "Fast emotional escalation",
+          evidence_msg_id: 3,
+        },
+      ],
     },
     flagged: "restricted",
   },
@@ -88,6 +119,7 @@ export const GENUINE_SCENARIO = [
       state: "normal",
       scam_type: "none",
       reasons: [],
+      signals: [],
     },
     flagged: null,
   },
@@ -107,6 +139,7 @@ export const GENUINE_SCENARIO = [
       state: "normal",
       scam_type: "none",
       reasons: [],
+      signals: [],
     },
     flagged: null,
   },
@@ -126,6 +159,7 @@ export const GENUINE_SCENARIO = [
       state: "normal",
       scam_type: "none",
       reasons: [],
+      signals: [],
     },
     flagged: null,
   },
