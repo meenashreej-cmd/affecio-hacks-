@@ -76,3 +76,64 @@ def test_cache_key_does_not_expose_api_key():
     assert secret not in key
     assert len(key) == 64
 
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.mark.asyncio
+async def test_llm_score_reuses_cached_result(monkeypatch):
+    """Identical scoring inputs should call the Claude API only once."""
+    scorer._score_cache.clear()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-api-key")
+    monkeypatch.setenv("LLM_MODEL", "test-model")
+
+    calls = 0
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="text",
+                        text=json.dumps({
+                            "score": 50,
+                            "reason": "test result",
+                        }),
+                    )
+                ],
+                usage=SimpleNamespace(
+                    input_tokens=10,
+                    output_tokens=10,
+                ),
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.messages = FakeMessages()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(scorer, "AsyncAnthropic", FakeClient)
+    monkeypatch.setattr(
+        scorer,
+        "validate_scorer_output",
+        lambda raw: json.loads(raw),
+    )
+
+    window = [{"sender_id": "user1", "text": "Hello"}]
+
+    first = await scorer.llm_score(window)
+    second = await scorer.llm_score(window)
+
+    assert first == second
+    assert calls == 1
