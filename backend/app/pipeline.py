@@ -1,14 +1,17 @@
+
 import asyncio
 import json
 import logging
 import os
 from typing import Any
+
 from sqlalchemy.orm import Session
 
 from backend.app.aggregator import aggregate_assessment
 from backend.app.db import SessionLocal
 from backend.app.models import Conversation, Message, RiskEvent, User
 from backend.app.ws import manager
+from backend.llm.guard import check_score_disagreement
 from backend.llm.scorer import llm_score
 from backend.rules.engine import rule_score
 
@@ -32,8 +35,12 @@ def _get_tracker(conversation_id: int) -> LLMTracker:
     return _conversation_trackers[conversation_id]
 
 
-def _build_window(db: Session, conversation_id: int, window_size: int = 12) -> list[dict[str, Any]]:
-    """Fetches up to the last 12 messages in chronological order (oldest first)."""
+def _build_window(
+    db: Session,
+    conversation_id: int,
+    window_size: int = 12,
+) -> list[dict[str, Any]]:
+    """Fetch up to the last 12 messages in chronological order."""
     recent_msgs = (
         db.query(Message)
         .filter(Message.conversation_id == conversation_id)
@@ -41,22 +48,31 @@ def _build_window(db: Session, conversation_id: int, window_size: int = 12) -> l
         .limit(window_size)
         .all()
     )
-    # Reverse so oldest is first
+
     ordered = list(reversed(recent_msgs))
     return [
         {
-            "id": m.id,
-            "sender_id": m.sender_id,
-            "text": m.text,
-            "created_at": m.created_at.isoformat(),
+            "id": message.id,
+            "sender_id": message.sender_id,
+            "text": message.text,
+            "created_at": message.created_at.isoformat(),
         }
-        for m in ordered
+        for message in ordered
     ]
 
 
-def _get_recipient_dict(db: Session, conversation: Conversation, sender_id: int) -> dict[str, Any]:
-    recipient_id = conversation.user_b if sender_id == conversation.user_a else conversation.user_a
+def _get_recipient_dict(
+    db: Session,
+    conversation: Conversation,
+    sender_id: int,
+) -> dict[str, Any]:
+    recipient_id = (
+        conversation.user_b
+        if sender_id == conversation.user_a
+        else conversation.user_a
+    )
     recipient = db.query(User).filter(User.id == recipient_id).first()
+
     if recipient:
         return {
             "id": recipient.id,
@@ -64,6 +80,7 @@ def _get_recipient_dict(db: Session, conversation: Conversation, sender_id: int)
             "is_new": recipient.is_new,
             "verified": recipient.verified,
         }
+
     return {}
 
 
@@ -74,27 +91,66 @@ async def run_llm_pipeline_task(
     rule_signals: list[dict[str, Any]],
     window: list[dict[str, Any]],
 ) -> None:
-    """Async background task to run LLM scoring, merge with aggregator, and broadcast updates."""
+    """Run LLM scoring, merge results, persist the assessment, and broadcast updates."""
     tracker = _get_tracker(conversation_id)
+
     try:
         timeout_seconds = int(os.getenv("LLM_TIMEOUT_SECONDS", "8"))
         llm_res: dict[str, Any] | None = None
+
         try:
-            llm_res = await asyncio.wait_for(llm_score(window), timeout=timeout_seconds)
-        except (asyncio.TimeoutError, Exception) as err:
-            logger.warning(f"LLM scoring failed or timed out for conversation {conversation_id}: {err}. Falling back to rule scoring.")
+            llm_res = await asyncio.wait_for(
+                llm_score(window),
+                timeout=timeout_seconds,
+            )
+        except Exception as err:
+            logger.warning(
+                "LLM scoring failed or timed out for conversation %s: %s. "
+                "Falling back to rule scoring.",
+                conversation_id,
+                err,
+            )
             llm_res = None
 
         with SessionLocal() as db:
-            conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+            conversation = (
+                db.query(Conversation)
+                .filter(Conversation.id == conversation_id)
+                .first()
+            )
             if not conversation:
                 return
 
-            recipient_dict = _get_recipient_dict(db, conversation, window[-1]["sender_id"] if window else 0)
+            recipient_dict = _get_recipient_dict(
+                db,
+                conversation,
+                window[-1]["sender_id"] if window else 0,
+            )
 
-            llm_risk_score = llm_res.get("risk_score") if llm_res else None
-            llm_scam_type = llm_res.get("scam_type", "none") if llm_res else "none"
-            llm_signals = llm_res.get("signals", []) if llm_res else []
+            llm_risk_score = (
+                llm_res.get("risk_score") if llm_res else None
+            )
+            llm_scam_type = (
+                llm_res.get("scam_type", "none") if llm_res else "none"
+            )
+            llm_signals = (
+                llm_res.get("signals", []) if llm_res else []
+            )
+
+            # If a high rule score conflicts with an LLM score of zero,
+            # avoid allowing the zero score to reduce the combined risk.
+            if llm_res and check_score_disagreement(
+                llm_res,
+                rule_score=rule_score_val,
+            ):
+                logger.warning(
+                    "Rule/LLM score disagreement for conversation %s; "
+                    "using rule-only scoring for this assessment.",
+                    conversation_id,
+                )
+                llm_risk_score = None
+                llm_scam_type = "none"
+                llm_signals = []
 
             previous_risk = conversation.risk
             previous_state = conversation.state
@@ -126,7 +182,6 @@ async def run_llm_pipeline_task(
             db.add(risk_event)
             db.commit()
 
-            # Broadcast risk update to clients
             await manager.broadcast(
                 conversation_id,
                 {
@@ -139,7 +194,10 @@ async def run_llm_pipeline_task(
                 },
             )
 
-            if conversation.state == "restricted" and previous_state != "restricted":
+            if (
+                conversation.state == "restricted"
+                and previous_state != "restricted"
+            ):
                 await manager.broadcast(
                     conversation_id,
                     {
@@ -148,8 +206,15 @@ async def run_llm_pipeline_task(
                         "reasons": assessment["reasons"],
                     },
                 )
+
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
-        logger.exception(f"Error in LLM background pipeline for conversation {conversation_id}: {exc}")
+        logger.exception(
+            "Error in LLM background pipeline for conversation %s: %s",
+            conversation_id,
+            exc,
+        )
     finally:
         tracker.is_in_flight = False
 
@@ -161,14 +226,17 @@ async def process_incoming_message(
     text: str,
 ) -> Message:
     """
-    Core pipeline executed after each incoming message:
-    1. Save message, broadcast the 'message' event.
-    2. Run rule_score synchronously, update risk, write risk_events row,
-       broadcast risk_update if risk or state changed.
-    3. Trigger llm_score as background task if conditions met (and not already in flight).
-    4. LLM failure falls back cleanly to rules.
+    Process an incoming message:
+    1. Save and broadcast the message.
+    2. Run rule-based scoring and persist the initial assessment.
+    3. Trigger LLM scoring in the background when conditions are met.
+    4. Fall back to rule-based scoring when LLM scoring fails.
     """
-    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    conversation = (
+        db.query(Conversation)
+        .filter(Conversation.id == conversation_id)
+        .first()
+    )
     if not conversation:
         raise ValueError(f"Conversation {conversation_id} not found")
 
@@ -197,11 +265,11 @@ async def process_incoming_message(
         },
     )
 
-    # 2. Window & Recipient extraction
+    # 2. Build the conversation window and recipient information
     window = _build_window(db, conversation_id, window_size=12)
     recipient_dict = _get_recipient_dict(db, conversation, sender_id)
 
-    # Run rule_score synchronously
+    # Run rule-based scoring synchronously
     rule_res = rule_score(window, recipient_dict)
     rule_score_val = int(rule_res.get("score", 0))
     rule_signals = rule_res.get("signals", [])
@@ -209,7 +277,7 @@ async def process_incoming_message(
     previous_risk = conversation.risk
     previous_state = conversation.state
 
-    # Run aggregator with rules only
+    # Initial assessment uses rules only
     assessment = aggregate_assessment(
         rule_score=rule_score_val,
         llm_score=None,
@@ -219,7 +287,10 @@ async def process_incoming_message(
         rule_signals=rule_signals,
     )
 
-    risk_changed = (assessment["risk"] != previous_risk) or (assessment["state"] != previous_state)
+    risk_changed = (
+        assessment["risk"] != previous_risk
+        or assessment["state"] != previous_state
+    )
 
     conversation.risk = assessment["risk"]
     conversation.state = assessment["state"]
@@ -249,7 +320,11 @@ async def process_incoming_message(
                 "reasons": assessment["reasons"],
             },
         )
-        if conversation.state == "restricted" and previous_state != "restricted":
+
+        if (
+            conversation.state == "restricted"
+            and previous_state != "restricted"
+        ):
             await manager.broadcast(
                 conversation_id,
                 {
@@ -259,16 +334,24 @@ async def process_incoming_message(
                 },
             )
 
-    # 3. Check trigger conditions for LLM background evaluation
+    # 3. Check conditions for background LLM evaluation
     tracker = _get_tracker(conversation_id)
-    total_messages = db.query(Message).filter(Message.conversation_id == conversation_id).count()
+    total_messages = (
+        db.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .count()
+    )
 
     messages_since_last_llm = total_messages - tracker.last_llm_msg_count
     rule_score_rise = rule_score_val - tracker.last_llm_rule_score
     hard_signal_fired = rule_score_val >= 25
 
     should_trigger_llm = (
-        (messages_since_last_llm >= 3 or rule_score_rise >= 20 or hard_signal_fired)
+        (
+            messages_since_last_llm >= 3
+            or rule_score_rise >= 20
+            or hard_signal_fired
+        )
         and not tracker.is_in_flight
     )
 
@@ -277,14 +360,18 @@ async def process_incoming_message(
         tracker.last_llm_msg_count = total_messages
         tracker.last_llm_rule_score = rule_score_val
 
-        asyncio.create_task(
-            run_llm_pipeline_task(
-                conversation_id=conversation_id,
-                message_id=new_message.id,
-                rule_score_val=rule_score_val,
-                rule_signals=rule_signals,
-                window=window,
+        try:
+            asyncio.create_task(
+                run_llm_pipeline_task(
+                    conversation_id=conversation_id,
+                    message_id=new_message.id,
+                    rule_score_val=rule_score_val,
+                    rule_signals=rule_signals,
+                    window=window,
+                )
             )
-        )
+        except Exception:
+            tracker.is_in_flight = False
+            raise
 
     return new_message
