@@ -25,7 +25,10 @@ backend/
 ├── rules/
 │   └── engine.py          # Rule engine stub (contract-compliant)
 ├── llm/
-│   └── scorer.py          # LLM scorer stub (contract-compliant, async)
+│   ├── scorer.py          # Async Anthropic-backed LLM scorer
+│   ├── schema.py
+│   ├── redact.py
+│   └── prompt.py
 └── tests/
     ├── test_aggregator.py # Unit tests for boundaries, decay, vulnerability adjustments, stickiness
     └── test_api.py        # Integration tests with FastAPI TestClient (media restriction & WS)
@@ -118,7 +121,51 @@ pytest backend/tests/test_api.py -v
 ```
 
 ---
+### 3. LLM Behavioral Scorer
 
+The LLM scorer evaluates recent conversation messages to identify potential scam-related behavioral patterns. It uses the Anthropic API and returns a structured assessment compatible with the backend's LLM scorer contract.
+
+**Output fields**
+- `risk_score`: Integer from 0 to 100.
+- `scam_type`: `romance`, `phishing`, `impersonation`, `sextortion`, or `none`.
+- `signals`: A list of behavioral indicators with supporting evidence.
+- `confidence`: Confidence value between 0 and 1.
+- `recommended_action`: `allow`, `warn`, `restrict_media`, or `block`.
+
+**Safety and privacy**
+- Redacts supported sensitive identifiers before submitting conversation data to the model.
+- Uses explicit instructions to treat conversation content as untrusted input and resist prompt injection.
+- Validates model output against a strict schema before returning it.
+- Returns `None` when scoring fails, the API key is missing, or the response cannot be validated.
+- Does not treat a model-generated score as proof of fraudulent behavior.
+
+**Configuration**
+
+Copy `.env.example` to `.env` and configure your Anthropic API key:
+
+```bash
+cp .env.example .env
+```
+
+Set `ANTHROPIC_API_KEY` to your own key and configure `LLM_MODEL` to a model available to your Anthropic account. Never commit `.env` or expose API keys in source code, logs, screenshots, or pull requests.
+
+**Testing**
+
+Run the full test suite:
+
+```bash
+pytest -v
+```
+
+Run the LLM scorer tests:
+
+```bash
+pytest backend/tests/test_llm_schema.py backend/tests/test_llm_redact.py backend/tests/test_llm_prompt.py backend/tests/test_llm_scorer.py -v
+```
+
+The scorer tests validate schema constraints, redaction behavior, prompt construction, and mocked API responses. Passing mocked tests does not by itself verify a live Anthropic API call.
+
+**Integration note:** The team should agree on numeric risk thresholds and action-mapping policy before relying on scores for enforcement decisions.
 ## Team Integration Contracts
 
 ### 1. Rule Engine Contract (`backend/rules/engine.py`)
