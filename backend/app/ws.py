@@ -5,6 +5,8 @@ from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 
 from backend.app.db import get_db
+from backend.app.models import Conversation
+from backend.app.rate_limiter import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,12 @@ async def websocket_endpoint(
     # Import pipeline lazily inside handler to prevent circular references
     from backend.app.pipeline import process_incoming_message
 
+    # Validate that user_id is a participant in this conversation
+    conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
+    if not conversation or user_id not in (conversation.user_a, conversation.user_b):
+        await websocket.close(code=4403, reason="User is not a participant in this conversation")
+        return
+
     await manager.connect(websocket, conversation_id)
     try:
         while True:
@@ -72,9 +80,14 @@ async def websocket_endpoint(
 
             event_type = payload.get("type")
             if event_type == "message":
-                sender_id = payload.get("sender_id", user_id)
+                # Ignore client-supplied sender_id and use connection's user_id
+                sender_id = user_id
                 text = payload.get("text", "")
                 if not text or not str(text).strip():
+                    continue
+
+                if limiter.is_rate_limited(sender_id):
+                    await websocket.send_json({"type": "error", "detail": "rate_limited"})
                     continue
 
                 await process_incoming_message(

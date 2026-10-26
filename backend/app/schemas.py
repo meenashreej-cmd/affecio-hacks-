@@ -130,6 +130,7 @@ class WSServerRiskUpdateEvent(BaseModel):
     state: str
     scam_type: str
     reasons: list[str]
+    suspect_id: int | None = None
 
 
 class WSServerMediaBlockedEvent(BaseModel):

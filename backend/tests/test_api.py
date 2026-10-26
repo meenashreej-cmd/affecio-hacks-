@@ -2,6 +2,7 @@ import io
 import os
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 # Configure fast LLM execution for tests
 os.environ["LLM_SLEEP_SECONDS"] = "0"
@@ -151,3 +152,94 @@ def test_websocket_chat_and_risk(client):
         assert risk_event["conversation_id"] == 2
         assert "risk" in risk_event
         assert "state" in risk_event
+        assert "suspect_id" in risk_event
+
+
+def test_media_upload_hardening(client):
+    """Test media upload validations: allowed extensions/content-types, 5MB limit, and UUID filename."""
+    # 1. Disallowed extension
+    files = {"file": ("malicious.exe", io.BytesIO(b"executable content"), "application/octet-stream")}
+    resp = client.post("/conversations/2/media", data={"sender_id": 1}, files=files)
+    assert resp.status_code == 400
+    assert "Invalid media type" in resp.json()["detail"]
+
+    # 2. Mismatched content-type
+    files = {"file": ("photo.png", io.BytesIO(b"pretend image"), "text/plain")}
+    resp = client.post("/conversations/2/media", data={"sender_id": 1}, files=files)
+    assert resp.status_code == 400
+
+    # 3. Size exceeding 5 MB
+    large_content = b"0" * (5 * 1024 * 1024 + 1)
+    files = {"file": ("huge_image.png", io.BytesIO(large_content), "image/png")}
+    resp = client.post("/conversations/2/media", data={"sender_id": 1}, files=files)
+    assert resp.status_code == 413
+    assert "exceeds" in resp.json()["detail"]
+
+    # 4. Valid image saves under a random UUID filename (never client's filename)
+    valid_content = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    files = {"file": ("my_sensitive_name.png", io.BytesIO(valid_content), "image/png")}
+    resp = client.post("/conversations/2/media", data={"sender_id": 1}, files=files)
+    assert resp.status_code == 201
+    saved_path = resp.json()["path"]
+    filename = os.path.basename(saved_path)
+    assert "my_sensitive_name" not in filename
+    assert filename.endswith(".png")
+    # UUID hex is 32 chars + .png = 36 chars
+    assert len(filename) == 36
+
+
+def test_media_blocked_event_on_upload_refusal(client):
+    """Test that media_blocked WebSocket event is emitted when upload is refused due to restricted state."""
+    # Restrict conversation 1
+    client.post(
+        "/conversations/1/messages",
+        json={"sender_id": 1, "text": "Move to whatsapp now."},
+    )
+
+    with client.websocket_connect("/ws/1?user_id=1") as websocket:
+        # Attempt media upload in restricted state
+        files = {"file": ("test.png", io.BytesIO(b"png data"), "image/png")}
+        media_resp = client.post("/conversations/1/media", data={"sender_id": 1}, files=files)
+        assert media_resp.status_code == 403
+
+        # WebSocket receives media_blocked event
+        event = websocket.receive_json()
+        assert event["type"] == "media_blocked"
+        assert event["conversation_id"] == 1
+        assert "reasons" in event
+        # Label should be humanized English
+        assert any("Asked to move the chat off the app" in r for r in event["reasons"])
+
+
+def test_post_message_non_participant_forbidden(client):
+    """POST /conversations/{id}/messages returns 403 when sender_id is not a participant."""
+    # Conversation 1 participants are user 1 (Asha) and user 3 (Sam).
+    # User 2 (Ravi) is NOT a participant.
+    resp = client.post(
+        "/conversations/1/messages",
+        json={"sender_id": 2, "text": "Intruder message"},
+    )
+    assert resp.status_code == 403
+    assert "not a participant" in resp.json()["detail"]
+
+
+def test_websocket_participant_validation_and_sender_id_override(client):
+    """
+    1. Verify non-participant connecting to WebSocket is closed with code 4403.
+    2. Verify WebSocket ignores client-supplied sender_id and uses the connection user_id.
+    """
+    # Conversation 1 participants: Asha (1) and Sam (3). User 2 (Ravi) is not a participant.
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with client.websocket_connect("/ws/1?user_id=2"):
+            pass
+    assert exc_info.value.code == 4403
+
+    # Valid participant connects: Asha (user_id=1)
+    with client.websocket_connect("/ws/1?user_id=1") as websocket:
+        # Client tries to spoof sender_id as 3 (Sam)
+        websocket.send_json({"type": "message", "sender_id": 3, "text": "I am actually Asha"})
+        evt = websocket.receive_json()
+        assert evt["type"] == "message"
+        # Server must override sender_id with connection's user_id (1)
+        assert evt["message"]["sender_id"] == 1
+        assert evt["message"]["text"] == "I am actually Asha"

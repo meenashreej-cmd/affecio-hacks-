@@ -6,6 +6,7 @@ from backend.app.aggregator import merge_reasons
 from backend.app.db import get_db
 from backend.app.models import Conversation, Message, RiskEvent, User
 from backend.app.pipeline import process_incoming_message
+from backend.app.rate_limiter import limiter
 from backend.app.schemas import (
     ConversationCreate,
     ConversationRead,
@@ -93,8 +94,14 @@ async def post_message(
 
     if payload.sender_id not in (conversation.user_a, conversation.user_b):
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Sender is not a participant in this conversation",
+        )
+
+    if limiter.is_rate_limited(payload.sender_id):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {limiter.max_messages} messages per {int(limiter.window_seconds)} seconds allowed.",
         )
 
     new_msg = await process_incoming_message(

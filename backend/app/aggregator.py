@@ -82,6 +82,43 @@ def determine_state(
     return "normal"
 
 
+SIGNAL_LABEL_MAP: dict[str, str] = {
+    "suspicious_keyword:whatsapp": "Asked to move the chat off the app",
+    "suspicious_keyword:gift card": "Asked for money or gift cards",
+    "suspicious_keyword:money": "Asked for money or gift cards",
+    "suspicious_keyword:link": "Shared a suspicious link",
+    "suspicious_keyword:links": "Shared a suspicious link",
+    "money/gift card": "Asked for money or gift cards",
+    "financial_solicitation": "Asked for money or gift cards",
+    "links": "Shared a suspicious link",
+    "whatsapp": "Asked to move the chat off the app",
+}
+
+
+def humanize_signal_label(label: str) -> str:
+    """
+    Translates technical or keyword signal labels into plain English sentences.
+    Unknown labels and labels that are already natural language sentences pass through unchanged.
+    """
+    if not label or not isinstance(label, str):
+        return str(label) if label else ""
+    if label in SIGNAL_LABEL_MAP:
+        return SIGNAL_LABEL_MAP[label]
+    lower = label.lower().strip()
+    if lower in SIGNAL_LABEL_MAP:
+        return SIGNAL_LABEL_MAP[lower]
+    if lower.startswith("suspicious_keyword:"):
+        kw = lower.split(":", 1)[1].strip()
+        if "whatsapp" in kw or "telegram" in kw or "chat" in kw or "phone" in kw:
+            return "Asked to move the chat off the app"
+        if "gift" in kw or "money" in kw or "card" in kw:
+            return "Asked for money or gift cards"
+        if "link" in kw or "url" in kw:
+            return "Shared a suspicious link"
+        return f"Mentioned suspicious keyword: {kw}"
+    return label
+
+
 def merge_reasons(
     rule_signals: list[dict[str, Any]] | None = None,
     llm_signals: list[dict[str, Any]] | None = None,
@@ -89,6 +126,7 @@ def merge_reasons(
 ) -> list[str]:
     """
     Merge reasons from rule and LLM signal labels (deduplicated, order-preserving, max 5).
+    Converts internal signal keys to plain English sentences.
     """
     reasons: list[str] = []
     seen: set[str] = set()
@@ -96,11 +134,13 @@ def merge_reasons(
     for signal_list in [rule_signals or [], llm_signals or []]:
         for item in signal_list:
             if isinstance(item, dict):
-                label = item.get("label") or item.get("evidence")
+                raw_label = item.get("label") or item.get("evidence")
             elif isinstance(item, str):
-                label = item
+                raw_label = item
             else:
-                label = str(item)
+                raw_label = str(item)
+
+            label = humanize_signal_label(raw_label) if raw_label else ""
 
             if label and label not in seen:
                 seen.add(label)
